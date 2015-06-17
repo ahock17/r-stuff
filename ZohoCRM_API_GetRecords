@@ -1,0 +1,218 @@
+library(jsonlite)
+library(httr)
+library(RODBC)
+
+### Grab Contacts Last Modified ###
+
+options(stringsAsFactors=FALSE)
+setInternet2(TRUE)
+
+wd <- "C:/Users/Public/Documents"
+setwd(wd)
+
+authtoken <- [enter authtoken]
+
+# Open connection to the database
+aws.connect <- odbcConnect('amazonaws_uma',ui=ui,pwd=pwd)
+
+# Query the DB to retrieve the last modified time
+lastmodified <- sqlQuery(aws.connect,'SELECT max([APICallTime]) FROM dbo.Contacts_UpdatedTime;')
+lastmodified <- as.character(format(lastmodified))
+
+fromIndex <- '1'
+toIndex <- '100000'
+
+repeat{
+  apiurl <- paste("https://crm.zoho.com/crm/private/json/Contacts/getRecords?newFormat=2&authtoken=",authtoken,"&scope=crmapi&selectColumns=All&lastModifiedTime=",lastmodified,'&fromIndex=',fromIndex,'&toIndex=',toIndex,sep="")
+  
+  # Fetch data and store it in memory
+  apicalltime <- format(Sys.time())
+  download.file(apiurl,'getContacts.json',method='internal')
+  getContacts <- fromJSON('getContacts.json')
+  
+  if (is.null(getContacts$response$nodata)==FALSE) {
+    break
+  }
+  
+  # Throw out metadata
+  getContacts.list <- getContacts$response$result$Contacts$row$FL
+  
+  # Get list of column names
+  getContacts.rows <- list(0)
+  names <- getContacts.list[[1]]$val
+  names[14] <- "MODIFIEDBYID"   # MODIFIEDBY was the original name, which is also the name of another column returned by the API
+  
+  # Further parse the data and assign column names
+  for (i in 1:length(getContacts.list)) {
+    getContacts.rows[[i]] <- getContacts.list[[i]]$content
+    names(getContacts.rows[[i]]) <- names
+  }
+  
+  # Convert to data frame
+  getContacts.df <- data.frame(matrix(unlist(getContacts.rows),nrow=length(getContacts.rows),byrow=TRUE))
+  names(getContacts.df) <- names(getContacts.rows[[1]])
+  
+  # Replace "null" with NA values; these will then get passed to the server as NULL
+  for (i in 1:length(names(getContacts.df))) {
+    getContacts.df[,i] <- replace(getContacts.df[,i],which(getContacts.df[,i]=="null"),NA)
+  }
+  
+  api_contact_ids <- paste("('",paste(getContacts.df[,1],collapse="','"),"')",sep="")
+  db_contactids <- sqlQuery(aws.connect,paste('SELECT CONTACTID FROM dbo.Contacts_Stage WHERE CONTACTID IN ', api_contact_ids, sep=""))
+  
+  getContactsNEW.df <- getContacts.df[which(!(getContacts.df$CONTACTID %in% as.character(db_contactids$CONTACTID))),]
+  getContactsOLD.df <- getContacts.df[which((getContacts.df$CONTACTID %in% as.character(db_contactids$CONTACTID))),]
+  
+  # Insert new records into Contacts_Stage only if there are new records to add
+  if (length(getContactsNEW.df[,1]) > 0) {
+    sqlSave(aws.connect,getContactsNEW.df,'dbo.Contacts_Stage',safer=TRUE,append=TRUE,rownames=FALSE)
+  }
+  
+  # Update records that already exist in Contacts staging table
+  sqlUpdate(aws.connect,getContactsOLD.df,'dbo.Contacts_Stage')
+  
+  # Zoho only allows 200 records to be fetched at a time
+  fromIndex <- as.character(as.numeric(fromIndex) + 200)
+  
+  # Write to audit table with each API Call
+  updatedtime <- format(Sys.time())
+  sqlQuery(aws.connect,paste("INSERT INTO dbo.Contacts_UpdatedTime VALUES ('",apicalltime,"','",updatedtime,"');",sep=""))
+}
+
+### Grab Job Orders Last Modified ###
+
+# Query the DB to retrieve the last modified time
+lastmodified <- sqlQuery(aws.connect,'SELECT max([APICallTime]) FROM dbo.Potentials_UpdatedTime;')
+lastmodified <- as.character(format(lastmodified))
+
+fromIndex <- '1'
+toIndex <- '100000'
+
+repeat{
+  apiurl <- paste("https://crm.zoho.com/crm/private/json/Potentials/getRecords?newFormat=2&authtoken=",authtoken,"&scope=crmapi&selectColumns=All&lastModifiedTime=",lastmodified,'&fromIndex=',fromIndex,'&toIndex=',toIndex,sep="")
+  
+  # Fetch data and store it in memory
+  apicalltime <- format(Sys.time())
+  download.file(apiurl,'getPotentials.json')
+  getPotentials <- fromJSON('getPotentials.json')
+  
+  if (is.null(getPotentials$response$nodata)==FALSE) {
+    break
+  }
+  
+  # Throw out metadata
+  getPotentials.list <- getPotentials$response$result$Potentials$row$FL
+  
+  # Get list of column names
+  getPotentials.rows <- list(0)
+  names <- getPotentials.list[[1]]$val
+  names[11] <- 'MODIFIEDBYID'
+  
+  # Further parse the data and assign column names
+  for (i in 1:length(getPotentials.list)) {
+    getPotentials.rows[[i]] <- getPotentials.list[[i]]$content
+    names(getPotentials.rows[[i]]) <- names
+  }
+  
+  # Convert to data frame
+  getPotentials.df <- data.frame(matrix(unlist(getPotentials.rows),nrow=length(getPotentials.rows),byrow=TRUE))
+  names(getPotentials.df) <- names(getPotentials.rows[[1]])
+  
+  # Replace "null" with NA values; these will then get passed to the server as NULL
+  for (i in 1:length(names(getPotentials.df))) {
+    getPotentials.df[,i] <- replace(getPotentials.df[,i],which(getPotentials.df[,i]=="null"),NA)
+  }
+
+  api_potential_ids <- paste("('",paste(getPotentials.df[,1],collapse="','"),"')",sep="")
+  db_potential_ids <- sqlQuery(aws.connect,paste('SELECT POTENTIALID FROM dbo.Potentials_Stage WHERE POTENTIALID IN ', api_potential_ids, sep=""))
+
+  getPotentialsNEW.df <- getPotentials.df[which(!(getPotentials.df$POTENTIALID %in% as.character(db_potential_ids$POTENTIALID))),]
+  getPotentialsOLD.df <- getPotentials.df[which((getPotentials.df$POTENTIALID %in% as.character(db_potential_ids$POTENTIALID))),]
+
+  # Insert new records into Potentials_Stage only if there are new records to add
+  if (length(getPotentialsNEW.df[,1]) > 0) {
+    sqlSave(aws.connect,getPotentialsNEW.df,'dbo.Potentials_Stage',safer=TRUE,append=TRUE,rownames=FALSE)
+  }
+  
+  # Update existing records
+  sqlUpdate(aws.connect,getPotentialsOLD.df,'dbo.Potentials_Stage')
+  
+  # Zoho only allows 200 records to be fetched at a time
+  fromIndex <- as.character(as.numeric(fromIndex) + 200)
+  
+  # Write to audit table with each API Call
+  updatedtime <- format(Sys.time())
+  sqlQuery(aws.connect,paste("INSERT INTO dbo.Potentials_UpdatedTime VALUES ('",apicalltime,"','",updatedtime,"');",sep=""))
+}
+
+### Grab Tasks Last Modified ###
+
+# Query the DB to retrieve the last modified time
+lastmodified <- sqlQuery(aws.connect,'SELECT max([APICallTime]) FROM dbo.Tasks_UpdatedTime;')
+lastmodified <- as.character(format(lastmodified))
+
+fromIndex <- '1'
+toIndex <- '100000'
+
+repeat{
+  apiurl <- paste("https://crm.zoho.com/crm/private/json/Tasks/getRecords?newFormat=2&authtoken=",authtoken,"&scope=crmapi&selectColumns=All&lastModifiedTime=",lastmodified,'&fromIndex=',fromIndex,'&toIndex=',toIndex,sep="")
+  
+  # Fetch data and store it in memory
+  apicalltime <- format(Sys.time())
+  download.file(apiurl,'getTasks.json')
+  getTasks <- fromJSON('getTasks.json')
+  
+  if (is.null(getTasks$response$nodata)==FALSE) {
+    break
+  }
+  
+  # Throw out metadata
+  getTasks.list <- getTasks$response$result$Tasks$row$FL
+  
+  # Get list of column names
+  getTasks.rows <- list(0)
+  getTasks.list[[1]] <- getTasks.list[[1]][which(!(getTasks.list[[1]]$val %in% c('RELATEDTOID','SEMODULE','ACICS Attestation Form Sent Date','ACICS Attestation Form Closed Date'))),]
+  names <- getTasks.list[[1]]$val
+  names[12] <- 'MODIFIEDBYID'
+
+  # Further parse the data and assign column names
+  for (i in 1:length(getTasks.list)) {
+    getTasks.list[[i]] <- getTasks.list[[i]][which(!(getTasks.list[[i]]$val %in% c('RELATEDTOID','SEMODULE','ACICS Attestation Form Sent Date','ACICS Attestation Form Closed Date'))),]
+    getTasks.rows[[i]] <- getTasks.list[[i]]$content
+    names(getTasks.rows[[i]]) <- names
+  }
+  
+  # Convert to data frame
+  getTasks.df <- data.frame(matrix(unlist(getTasks.rows),nrow=length(getTasks.rows),byrow=TRUE))
+  names(getTasks.df) <- names(getTasks.rows[[1]])
+
+  # Replace "null" with NA values; these will then get passed to the server as NULL
+  for (i in 1:length(names(getTasks.df))) {
+    getTasks.df[,i] <- replace(getTasks.df[,i],which(getTasks.df[,i]=="null"),NA)
+  }
+  
+  api_task_ids <- paste("('",paste(getTasks.df[,1],collapse="','"),"')",sep="")
+  db_task_ids <- sqlQuery(aws.connect,paste('SELECT ACTIVITYID FROM dbo.Tasks_Stage WHERE ACTIVITYID IN ', api_task_ids, sep=""))
+  
+  getTasksNEW.df <- getTasks.df[which(!(getTasks.df$ACTIVITYID %in% as.character(db_task_ids$ACTIVITYID))),]
+  getTasksOLD.df <- getTasks.df[which((getTasks.df$ACTIVITYID %in% as.character(db_task_ids$ACTIVITYID))),]
+  
+  # Insert new records into Tasks_Stage only if there are new records to add
+  if (length(getTasksNEW.df[,1]) > 0) {
+    sqlSave(aws.connect,getTasksNEW.df,'dbo.Tasks_Stage',safer=TRUE,append=TRUE,rownames=FALSE)
+  }
+
+  # Write to disk
+  # write.csv(getTasks.df,file="lastmodified_Tasks.csv",row.names=FALSE)
+ 
+  # Update existing records
+  sqlUpdate(aws.connect,getTasksOLD.df,'dbo.Tasks_Stage')
+
+  fromIndex <- as.character(as.numeric(fromIndex) + 200)
+  
+  updatedtime <- format(Sys.time())
+  sqlQuery(aws.connect,paste("INSERT INTO dbo.Tasks_UpdatedTime VALUES ('",apicalltime,"','",updatedtime,"');",sep=""))
+}
+
+# Close connection
+close(aws.connect)
